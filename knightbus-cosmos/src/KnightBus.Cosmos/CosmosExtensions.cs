@@ -19,7 +19,7 @@ public static class CosmosExtensions
         {
             AllowBulkExecution = true,
             MaxRetryAttemptsOnRateLimitedRequests = 200,
-            MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(60)
+            MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(90)
         }));
         
         return collection;

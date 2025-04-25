@@ -9,19 +9,19 @@ namespace KnightBus.Cosmos;
 public class CosmosQueueClient<T> where T : class, IMessage
 {
     private readonly ICosmosConfiguration _cosmosConfiguration;
-    public CosmosClient Client { get; private set; }
-    public Database Database { get; private set; }
+    private CosmosClient Client { get; set; }
+    private Database Database { get; set; }
     public Container TopicQueue { get; private set; }
     public Container RetryQueue { get; private set; }
     public Container Lease { get; private set; }
     private Container DeadLetterQueue { get; set; }
+
+    private IEventSubscription Subscription { get; set; }
     
-    public IEventSubscription? _subscription { get; private set; }
-    
-    public CosmosQueueClient(ICosmosConfiguration cosmosConfiguration, IEventSubscription? subscription)
+    public CosmosQueueClient(ICosmosConfiguration cosmosConfiguration, IEventSubscription subscription)
     {
         _cosmosConfiguration = cosmosConfiguration;
-        _subscription = subscription;
+        Subscription = subscription;
     }
 
     // subscription client
@@ -32,7 +32,7 @@ public class CosmosQueueClient<T> where T : class, IMessage
         Client = cosmosClient;
         
         //Get database, create if it does not exist
-        DatabaseResponse databaseResponse = await Client.CreateDatabaseIfNotExistsAsync(_cosmosConfiguration.Database, 1000, null, cancellationToken);
+        DatabaseResponse databaseResponse = await Client.CreateDatabaseIfNotExistsAsync(_cosmosConfiguration.Database, 50000, null, cancellationToken);
         CheckHttpResponse(databaseResponse.StatusCode, _cosmosConfiguration.Database);
         Database = databaseResponse.Database;
         
@@ -42,7 +42,7 @@ public class CosmosQueueClient<T> where T : class, IMessage
         DeadLetterQueue = await CreateContainerAsync(AutoMessageMapper.GetQueueName<T>() +" : DL", cancellationToken, "/Subscription",-1 ); //Deadlettered items should never expire
         
         if (typeof(ICosmosEvent).IsAssignableFrom(typeof(T)))
-            RetryQueue = await CreateContainerAsync(AutoMessageMapper.GetQueueName<T>() + " : Retry - " + _subscription!.Name , cancellationToken);
+            RetryQueue = await CreateContainerAsync(AutoMessageMapper.GetQueueName<T>() + " : Retry - " + Subscription.Name , cancellationToken);
     }
     
     //TODO: Does not handle cases where PartitionKey does not match
@@ -101,7 +101,7 @@ public class CosmosQueueClient<T> where T : class, IMessage
 
     public async Task DeadLetterAsync(InternalCosmosMessage<T> message)
     {
-        DeadLetterCosmosMessage<T> deadLetterMessage = message.ToDeadLetterMessage(AutoMessageMapper.GetQueueName<T>(), _subscription!.Name);
+        DeadLetterCosmosMessage<T> deadLetterMessage = message.ToDeadLetterMessage(AutoMessageMapper.GetQueueName<T>(), Subscription.Name);
         await DeadLetterQueue.CreateItemAsync(deadLetterMessage, new PartitionKey(deadLetterMessage.Subscription));
     }
 
