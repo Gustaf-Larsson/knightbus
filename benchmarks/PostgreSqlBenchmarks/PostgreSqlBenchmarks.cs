@@ -1,23 +1,22 @@
 ﻿using System.Collections.Concurrent;
 using KnightBus.Core;
 using KnightBus.Core.DependencyInjection;
-using KnightBus.Cosmos;
-using KnightBus.Cosmos.Messages;
 using KnightBus.Host;
+using KnightBus.Messages;
+using KnightBus.PostgreSql;
+using KnightBus.PostgreSql.Messages;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using System.IO;
-using CosmosBenchmarks.Events;
+using Npgsql;
+using PostgresBenchmarks.Events;
 
-namespace CosmosBenchmarks;
+namespace PostgresBenchmarks;
 
-public class CosmosBenchmarks
+public class PostgreSqlBenchmarks
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(300);
-    private CosmosBus? _publisher;
+    private PostgresBus _publisher;
     private IHost? _knightBusHost;
-    private const string DatabaseName = "PubSub";
-    const string LeaseContainer = "Leases";
     public static async Task Main(String[] args)
     {
         if (args == null || args.Length < 2)
@@ -25,7 +24,7 @@ public class CosmosBenchmarks
             throw new Exception("2 arguments required");
         }
 
-        CosmosBenchmarks cosmosBenchmarks = new CosmosBenchmarks();
+        PostgreSqlBenchmarks postgreSqlBenchmarks = new PostgreSqlBenchmarks();
 
         int numMessages = int.Parse(args[0]);
         int numSubs = int.Parse(args[1]);
@@ -33,36 +32,36 @@ public class CosmosBenchmarks
         switch (numSubs)
         {
             case 1:
-                await cosmosBenchmarks.TimeFromSendToProcessed<OneSubCosmosEvent, OneSubEventProcessor>(
-                    i => new OneSubCosmosEvent() { MessageBody = $"event {i}" },
+                await postgreSqlBenchmarks.TimeFromSendToProcessed<OneSubEvent, OneSubEventProcessor>(
+                    i => new OneSubEvent() { MessageBody = $"event {i}" },
                     msg => msg.MessageBody,
                     numMessages,
                     1);
                 break;
             case 2:
-                await cosmosBenchmarks.TimeFromSendToProcessed<TwoSubCosmosEvent, TwoSubEventProcessor>(
-                    i => new TwoSubCosmosEvent() { MessageBody = $"event {i}" },
+                await postgreSqlBenchmarks.TimeFromSendToProcessed<TwoSubEvent, TwoSubEventProcessor>(
+                    i => new TwoSubEvent() { MessageBody = $"event {i}" },
                     msg => msg.MessageBody,
                     numMessages,
                     2);
                 break;
             case 4:
-                await cosmosBenchmarks.TimeFromSendToProcessed<FourSubCosmosEvent, FourSubEventProcessor>(
-                    i => new FourSubCosmosEvent() { MessageBody = $"event {i}" },
+                await postgreSqlBenchmarks.TimeFromSendToProcessed<FourSubEvent, FourSubEventProcessor>(
+                    i => new FourSubEvent() { MessageBody = $"event {i}" },
                     msg => msg.MessageBody,
                     numMessages,
                     4);
                 break;
             case 8:
-                await cosmosBenchmarks.TimeFromSendToProcessed<EightSubCosmosEvent, EightSubEventProcessor>(
-                    i => new EightSubCosmosEvent() { MessageBody = $"event {i}" },
+                await postgreSqlBenchmarks.TimeFromSendToProcessed<EightSubEvent, EightSubEventProcessor>(
+                    i => new EightSubEvent() { MessageBody = $"event {i}" },
                     msg => msg.MessageBody,
                     numMessages,
                     8);
                 break;
             case 16:
-                await cosmosBenchmarks.TimeFromSendToProcessed<SixteenSubCosmosEvent, SixteenSubEventProcessor>(
-                    i => new SixteenSubCosmosEvent() { MessageBody = $"event {i}" },
+                await postgreSqlBenchmarks.TimeFromSendToProcessed<SixteenSubEvent, SixteenSubEventProcessor>(
+                    i => new SixteenSubEvent() { MessageBody = $"event {i}" },
                     msg => msg.MessageBody,
                     numMessages,
                     16);
@@ -79,7 +78,7 @@ public class CosmosBenchmarks
         int numMessages,
         int subscribers)
         where TProcessor : class
-        where TMessage : ICosmosEvent
+        where TMessage : IPostgresEvent
     {
         await Setup<TProcessor>();
         
@@ -94,14 +93,14 @@ public class CosmosBenchmarks
         }
         
         var startTime = DateTime.UtcNow;
-        
-        await _publisher!.PublishAsync(messages, CancellationToken.None);
-  
+        await _publisher.PublishAsync(messages, CancellationToken.None);
+
         bool withinTime = true;
-        
-        int missed = 0;
+        int missed;
         int lastMissed = 0;
         int sameMisses = 0;
+        
+        
         while ((missed = (ProcessedMessages.MissedAndDuplicateProcessed(messageContents, subscribers).Item1)) > 0 &&
                (withinTime = (DateTime.UtcNow.Subtract(startTime)) < Timeout))
         {
@@ -115,7 +114,7 @@ public class CosmosBenchmarks
                 sameMisses = 0;
             }
 
-            //If no new messages have been processed for the past 5s, assume those messages are lost
+            //If no new messages have been processed for the at least 5s, assume those messages are lost
             if (sameMisses >= 500)
                 break;
             await Task.Delay(TimeSpan.FromMilliseconds(10));
@@ -124,16 +123,16 @@ public class CosmosBenchmarks
         TimeSpan elapsedTime = withinTime ? DateTime.UtcNow.Subtract(startTime) : TimeSpan.Zero;
         
         (int notProcessed, int duplicate) = ProcessedMessages.MissedAndDuplicateProcessed(messageContents, subscribers);
-        await TearDown();
+        await TearDown<TMessage>();
         
-        Console.Error.WriteLine($"Time: {elapsedTime} | missed: {missed} | duplicates: {duplicate}");
+        Console.Error.WriteLine($"Time: {elapsedTime} | missed: {notProcessed} | duplicates: {duplicate}");
     }
     
     //Setup
     private async Task Setup<TEventProcessor>() where TEventProcessor : class
     {
-        //Connection string should be saved as environment variable named "CosmosString"
-        var connectionString = Environment.GetEnvironmentVariable("CosmosString");
+        //Connection string should be saved as environment variable named "PostgreSqlString"
+        var connectionString = Environment.GetEnvironmentVariable("PostgreString")+"Include Error Detail=true";
 
         _knightBusHost = Microsoft.Extensions.Hosting.Host.CreateDefaultBuilder()
             .UseDefaultServiceProvider(options =>
@@ -143,37 +142,47 @@ public class CosmosBenchmarks
             })
             .ConfigureServices(services =>
             {
-                services.UseCosmos(configuration =>
+                services.UsePostgres(configuration =>
                     {
                         configuration.ConnectionString = connectionString;
-                        configuration.Database = DatabaseName;
-                        configuration.LeaseContainer = LeaseContainer;
                         configuration.PollingDelay = TimeSpan.FromMilliseconds(500);
-                        configuration.DefaultTimeToLive = TimeSpan.FromSeconds(180);
                     })
                     .RegisterProcessor<TEventProcessor>()
-                    .UseTransport<CosmosTransport>();
+                    .UseTransport<PostgresTransport>();
 
                 services.AddSingleton<ProcessedMessages>();
             })
-            .UseKnightBus()
+            .UseKnightBus(c => c.ShutdownGracePeriod = TimeSpan.FromSeconds(2))
             .Build();
 
         //Start the KnightBus Host
         await _knightBusHost.StartAsync();
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await Task.Delay(TimeSpan.FromSeconds(5));
 
-        _publisher = _knightBusHost.Services.CreateScope().ServiceProvider.GetRequiredService<CosmosBus>();
+        _publisher = (PostgresBus)_knightBusHost.Services.CreateScope().ServiceProvider.GetRequiredService<IPostgresBus>();
     }
     
-    //Delete cosmos database and close connection
-    public async Task TearDown()
+    //Delete PostgreSql database and close connection
+    public async Task TearDown<TMessage>() where TMessage : IPostgresEvent
     {
         ProcessedMessages.dict = new ConcurrentDictionary<string, int>();
-        
-        await _publisher!.RemoveDatabase();
         _knightBusHost?.Dispose();
-        _publisher!.Dispose();
+        await using var conn = new NpgsqlConnection(Environment.GetEnvironmentVariable("PostgreString"));
+        await conn.OpenAsync();
+
+        var dropSchema = $"DROP Schema IF EXISTS knightbus CASCADE";
+
+        await using var cmd = new NpgsqlCommand(dropSchema, conn);
+        try
+        {
+            await cmd.ExecuteNonQueryAsync();
+            Console.WriteLine($"Schema dropped successfully - {dropSchema}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error dropping Schema: {ex.Message}");
+        }
+
     }
 }
 
@@ -205,4 +214,7 @@ class ProcessedMessages()
         return (notProcessed, duplicateProcessed);
     }
 }
+
+
+
 

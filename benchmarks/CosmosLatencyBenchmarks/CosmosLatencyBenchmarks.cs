@@ -11,7 +11,7 @@ using CosmosBenchmarks.Events;
 
 namespace CosmosBenchmarks;
 
-public class CosmosBenchmarks
+public class CosmosLatencyBenchmarks
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(300);
     private CosmosBus? _publisher;
@@ -25,7 +25,7 @@ public class CosmosBenchmarks
             throw new Exception("2 arguments required");
         }
 
-        CosmosBenchmarks cosmosBenchmarks = new CosmosBenchmarks();
+        CosmosLatencyBenchmarks cosmosBenchmarks = new CosmosLatencyBenchmarks();
 
         int numMessages = int.Parse(args[0]);
         int numSubs = int.Parse(args[1]);
@@ -72,7 +72,7 @@ public class CosmosBenchmarks
         }
     }
     
-    //Benchmark the elapsed time from sending messages to all messages being processed
+    //Benchmark the elapsed time to send messages
     private async Task TimeFromSendToProcessed<TMessage, TProcessor>(
         Func<int, TMessage> messageFactory,
         Func<TMessage, string> getMessageBody,
@@ -85,48 +85,17 @@ public class CosmosBenchmarks
         
         //Send some commands
         TMessage[] messages = new TMessage[numMessages];
-        string[] messageContents = new string[numMessages];
         for (int i = 0; i < numMessages; i++)
         {
             TMessage message = messageFactory(i);
             messages[i] = message;
-            messageContents[i] = getMessageBody(message);
         }
         
         var startTime = DateTime.UtcNow;
-        
         await _publisher!.PublishAsync(messages, CancellationToken.None);
-  
-        bool withinTime = true;
-        
-        int missed = 0;
-        int lastMissed = 0;
-        int sameMisses = 0;
-        while ((missed = (ProcessedMessages.MissedAndDuplicateProcessed(messageContents, subscribers).Item1)) > 0 &&
-               (withinTime = (DateTime.UtcNow.Subtract(startTime)) < Timeout))
-        {
-            if (missed > 0 && missed == lastMissed)
-            {
-                sameMisses++;
-            }
-            else
-            {
-                lastMissed = missed;
-                sameMisses = 0;
-            }
-
-            //If no new messages have been processed for the past 5s, assume those messages are lost
-            if (sameMisses >= 500)
-                break;
-            await Task.Delay(TimeSpan.FromMilliseconds(10));
-        }
-
-        TimeSpan elapsedTime = withinTime ? DateTime.UtcNow.Subtract(startTime) : TimeSpan.Zero;
-        
-        (int notProcessed, int duplicate) = ProcessedMessages.MissedAndDuplicateProcessed(messageContents, subscribers);
+        TimeSpan elapsedTime = DateTime.UtcNow.Subtract(startTime);
+        Console.Error.WriteLine($"time: {elapsedTime}");
         await TearDown();
-        
-        Console.Error.WriteLine($"Time: {elapsedTime} | missed: {missed} | duplicates: {duplicate}");
     }
     
     //Setup
@@ -153,8 +122,6 @@ public class CosmosBenchmarks
                     })
                     .RegisterProcessor<TEventProcessor>()
                     .UseTransport<CosmosTransport>();
-
-                services.AddSingleton<ProcessedMessages>();
             })
             .UseKnightBus()
             .Build();
@@ -169,40 +136,8 @@ public class CosmosBenchmarks
     //Delete cosmos database and close connection
     public async Task TearDown()
     {
-        ProcessedMessages.dict = new ConcurrentDictionary<string, int>();
-        
         await _publisher!.RemoveDatabase();
         _knightBusHost?.Dispose();
         _publisher!.Dispose();
     }
 }
-
-class ProcessedMessages()
-{
-    //Uses message strings as id - therefore all message strings need to be unique
-    public static ConcurrentDictionary<string, int> dict { get; set; } = new ConcurrentDictionary<string, int>();
-
-    public static void Increment(string key)
-    {
-        dict.AddOrUpdate(key, 1, (_, val) => val + 1);
-    }
-
-    public static (int,int) MissedAndDuplicateProcessed(IEnumerable<string> messageStrings, int deliveriesPerMessage = 1)
-    {
-        int notProcessed = 0;
-        int duplicateProcessed = 0;
-        foreach (var id in messageStrings)
-        {
-            if (!dict.TryGetValue(id, out var value) || value < deliveriesPerMessage)
-            {
-                notProcessed++;
-            }
-            else if(value > deliveriesPerMessage)
-            {
-                duplicateProcessed++;
-            }
-        }
-        return (notProcessed, duplicateProcessed);
-    }
-}
-

@@ -1,8 +1,8 @@
 ﻿using KnightBus.Core;
 
-namespace CosmosBenchmarks.Events;
+namespace PostgresBenchmarks.Events;
 
-class CosmosProcessingSettings : IProcessingSettings
+public class ProcessingSettings : IProcessingSettings
 {
     public int MaxConcurrentCalls => 10; //Currently not used
     public int PrefetchCount => 50; //Currently not used
