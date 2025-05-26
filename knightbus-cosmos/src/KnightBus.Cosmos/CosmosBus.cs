@@ -36,6 +36,7 @@ public class CosmosBus : ICosmosBus
         _client.Dispose();
     }
 
+    //created purely for benchmark teardown
     public async Task RemoveDatabase()
     {
         Database database = _client.GetDatabase(_cosmosConfiguration.Database);

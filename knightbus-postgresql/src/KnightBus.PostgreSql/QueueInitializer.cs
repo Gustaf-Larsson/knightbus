@@ -1,11 +1,12 @@
-﻿using Npgsql;
+﻿using System.Transactions;
+using Npgsql;
 using static KnightBus.PostgreSql.PostgresConstants;
 
 namespace KnightBus.PostgreSql;
 
 public static class QueueInitializer
 {
-
+    private static readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
     public static async Task InitSubscription(PostgresQueueName topic, PostgresQueueName subscription, NpgsqlDataSource npgsqlDataSource)
     {
         await using var connection = await npgsqlDataSource.OpenConnectionAsync();
@@ -17,23 +18,51 @@ public static class QueueInitializer
 
         var topicSubscriptionQueueName = PostgresQueueName.Create($"{topic}_{subscription}");
 
-        await using var createPublishFunctionCmd = CreatePublishFunction(connection);
-        await using var createTopicCmd = CreateTopicTableCmd(topic, connection);
-        await using var insertTopicCmd = InsertTopicSubscriptionCmd(topic, subscription, connection);
+        await using var createPublishFunctionCmd = CreatePublishFunction(connection, transaction);
+        await using var createTopicCmd = CreateTopicTableCmd(topic, connection, transaction);
+        await using var insertTopicCmd = InsertTopicSubscriptionCmd(topic, subscription, connection, transaction);
 
-        await using var createQueueCmd = CreateQueueCmd(SubscriptionPrefix, topicSubscriptionQueueName, connection);
-        await using var createIndexCmd = CreateQueueIndexCmd(SubscriptionPrefix, topicSubscriptionQueueName, connection);
-        await using var createDlQueueCmd = CreateDlQueueCmd(DlQueuePrefix, topicSubscriptionQueueName, connection);
+        await using var createQueueCmd = CreateQueueCmd(SubscriptionPrefix, topicSubscriptionQueueName, connection, transaction);
+        await using var createIndexCmd = CreateQueueIndexCmd(SubscriptionPrefix, topicSubscriptionQueueName, connection, transaction);
+        await using var createDlQueueCmd = CreateDlQueueCmd(DlQueuePrefix, topicSubscriptionQueueName, connection, transaction);
+        
 
-        await createSchema.ExecuteNonQueryAsync().ConfigureAwait(false);
-        await createTopicCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-        await insertTopicCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-        await createQueueCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-        await createIndexCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-        await createDlQueueCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-        await createPublishFunctionCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+        await _semaphore.WaitAsync();
 
-        await transaction.CommitAsync();
+        try
+        {
+            await createSchema.ExecuteNonQueryAsync().ConfigureAwait(false);
+            await createTopicCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+
+            await insertTopicCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+
+            await createQueueCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+            await createIndexCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+            await createDlQueueCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+            await createPublishFunctionCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+            await transaction.CommitAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"SQL setup failed for sub {subscription} - {ex}");
+            
+            try
+            {
+                await transaction.RollbackAsync();
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Rollback failed {e.Message}");
+                throw;
+            }
+        }
+        finally
+        { 
+            _semaphore.Release();   
+        }
     }
 
     public static async Task InitQueue(PostgresQueueName queueName, NpgsqlDataSource npgsqlDataSource)
@@ -45,11 +74,11 @@ public static class QueueInitializer
  CREATE SCHEMA IF NOT EXISTS {SchemaName};
 ", connection);
 
-        await using var createQueueCmd = CreateQueueCmd(QueuePrefix, queueName, connection);
-        await using var createDlQueueCmd = CreateDlQueueCmd(DlQueuePrefix, queueName, connection);
-        await using var createIndexCmd = CreateQueueIndexCmd(QueuePrefix, queueName, connection);
-        await using var createMetadataTableCmd = CreateMetadataTableCmd(connection);
-        await using var insertMetadataCmd = InsertMetadataCmd(queueName, connection);
+        await using var createQueueCmd = CreateQueueCmd(QueuePrefix, queueName, connection, transaction);
+        await using var createDlQueueCmd = CreateDlQueueCmd(DlQueuePrefix, queueName, connection, transaction);
+        await using var createIndexCmd = CreateQueueIndexCmd(QueuePrefix, queueName, connection, transaction);
+        await using var createMetadataTableCmd = CreateMetadataTableCmd(connection, transaction);
+        await using var insertMetadataCmd = InsertMetadataCmd(queueName, connection, transaction);
 
         await createSchema.ExecuteNonQueryAsync().ConfigureAwait(false);
         await createQueueCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
@@ -62,28 +91,28 @@ public static class QueueInitializer
     }
 
 
-    private static NpgsqlCommand CreateTopicTableCmd(PostgresQueueName topic, NpgsqlConnection connection)
+    private static NpgsqlCommand CreateTopicTableCmd(PostgresQueueName topic, NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var createTopicTableCmd = new NpgsqlCommand($@"
 CREATE TABLE IF NOT EXISTS {SchemaName}.{TopicPrefix}_{topic} (
     subscription_name VARCHAR UNIQUE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
-);", connection);
+);", connection, transaction);
         return createTopicTableCmd;
     }
 
-    private static NpgsqlCommand InsertTopicSubscriptionCmd(PostgresQueueName topic, PostgresQueueName topicSubscription, NpgsqlConnection connection)
+    private static NpgsqlCommand InsertTopicSubscriptionCmd(PostgresQueueName topic, PostgresQueueName topicSubscription, NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var insertMetadataCmd = new NpgsqlCommand(@$"
 INSERT INTO {SchemaName}.{TopicPrefix}_{topic}(subscription_name)
 VALUES ('{topicSubscription}')
 ON CONFLICT
 DO NOTHING;",
-            connection);
+            connection, transaction);
         return insertMetadataCmd;
     }
 
-    private static NpgsqlCommand CreatePublishFunction(NpgsqlConnection connection)
+    private static NpgsqlCommand CreatePublishFunction(NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var publishFunction = new NpgsqlCommand(@$"
 CREATE OR REPLACE FUNCTION {SchemaName}.publish_events(
@@ -106,41 +135,41 @@ BEGIN
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;",
-            connection);
+            connection, transaction);
         return publishFunction;
     }
 
-    private static NpgsqlCommand InsertMetadataCmd(PostgresQueueName queueName, NpgsqlConnection connection)
+    private static NpgsqlCommand InsertMetadataCmd(PostgresQueueName queueName, NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var insertMetadataCmd = new NpgsqlCommand(@$"
 INSERT INTO {SchemaName}.metadata (queue_name)
 VALUES ('{queueName}')
 ON CONFLICT
 DO NOTHING;",
-                connection);
+                connection, transaction);
         return insertMetadataCmd;
     }
 
-    private static NpgsqlCommand CreateMetadataTableCmd(NpgsqlConnection connection)
+    private static NpgsqlCommand CreateMetadataTableCmd(NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var createMetadataTableCmd = new NpgsqlCommand($@"
 CREATE TABLE IF NOT EXISTS {SchemaName}.metadata (
     queue_name VARCHAR UNIQUE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
-);", connection);
+);", connection, transaction);
         return createMetadataTableCmd;
     }
 
-    private static NpgsqlCommand CreateQueueIndexCmd(string prefix, PostgresQueueName queueName, NpgsqlConnection connection)
+    private static NpgsqlCommand CreateQueueIndexCmd(string prefix, PostgresQueueName queueName, NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var createIndexCmd = new NpgsqlCommand(@$"
 CREATE INDEX IF NOT EXISTS {SchemaName}_{prefix}_{queueName}_visibility_timeout_idx
 ON {SchemaName}.{prefix}_{queueName} (visibility_timeout ASC);",
-                connection);
+                connection, transaction);
         return createIndexCmd;
     }
 
-    private static NpgsqlCommand CreateDlQueueCmd(string prefix, PostgresQueueName queueName, NpgsqlConnection connection)
+    private static NpgsqlCommand CreateDlQueueCmd(string prefix, PostgresQueueName queueName, NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var createDlQueueCmd = new NpgsqlCommand(@$"
 CREATE TABLE IF NOT EXISTS {SchemaName}.{prefix}_{queueName} (
@@ -149,11 +178,11 @@ CREATE TABLE IF NOT EXISTS {SchemaName}.{prefix}_{queueName} (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
     message JSONB,
     properties JSONB
-);", connection);
+);", connection, transaction);
         return createDlQueueCmd;
     }
 
-    private static NpgsqlCommand CreateQueueCmd(string prefix, PostgresQueueName queueName, NpgsqlConnection connection)
+    private static NpgsqlCommand CreateQueueCmd(string prefix, PostgresQueueName queueName, NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         var createQueueCmd = new NpgsqlCommand(@$"
 CREATE TABLE IF NOT EXISTS {SchemaName}.{prefix}_{queueName} (
@@ -163,7 +192,7 @@ CREATE TABLE IF NOT EXISTS {SchemaName}.{prefix}_{queueName} (
     visibility_timeout TIMESTAMP WITH TIME ZONE NOT NULL,
     message JSONB,
     properties JSONB
-);", connection);
+);", connection, transaction);
         return createQueueCmd;
     }
 }
